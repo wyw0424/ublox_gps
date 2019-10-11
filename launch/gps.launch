@@ -1,0 +1,8 @@
+<launch>
+
+  <!--param name="use_sim_time" value="true" /-->
+  <arg name="dataset" /> 
+
+  <node pkg="ublox_gps" name="ublox_gps_ros_node" type="ublox_gps_ros_node" output="screen">
+  </node>
+</launch>
