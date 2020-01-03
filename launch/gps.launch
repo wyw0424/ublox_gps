@@ -1,8 +1,14 @@
 <launch>
 
   <!--param name="use_sim_time" value="true" /-->
-  <arg name="dataset" /> 
+  <!--arg name="dataset" /--> 
 
-  <node pkg="ublox_gps" name="ublox_gps_ros_node" type="ublox_gps_ros_node" output="screen">
+  <node pkg="gps_node" name="gps_node" type="gps_node" output="screen">
+    <param name="fix_frame" value="/map" />
+    <param name="base_link" value="/base_link" />
+    <param name="gps_data_file" value="/home/derek/gps.txt" />
+    <param name="gps_dev_addr" value="/dev/ttyUSB0" />
+    <param name="gps_ntrip_userpwd" value="" />
+    <param name="gps_ntrip_server" value="" />
   </node>
 </launch>

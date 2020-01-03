@@ -1,2 +1,1 @@
-# ublox_gps
-ublox gps ros driver
+# gps node with covariance

@@ -1,3 +1,4 @@
+#include "Socket.h"
 #include "Uart.h"
 #include "UbloxGPS.h"
 #include <ublox/field/GnssId.h>
@@ -9,6 +10,7 @@
 #include <comms/units.h>
 #include <comms/process.h>
 #include <iostream>
+#include <sstream>
 
 using namespace wincomm;
 
@@ -16,16 +18,28 @@ static void threadFunction(void* userData)
 {
     UbloxGPS* gps = (UbloxGPS*)userData;
     gps->requestPositionPoll();
+    //gps->requestSatellitePoll();
 }
 
 UbloxGPS::~UbloxGPS()
 {
-    _timer.stop();
+    
+    disconnectNtripCaster();
+    stop();
+}
+
+void UbloxGPS::start(const std::string& filename, int linesPerRead, int reqPositionMS)
+{
+    _uart = NULL; _linesReadFromEmuFile = linesPerRead;
+    _emulatedFile = std::ifstream(filename.c_str());
+    if (reqPositionMS > 0)
+        _timer.start(std::chrono::milliseconds(reqPositionMS), threadFunction, this);
+    configureUbxOutput();
 }
 
 void UbloxGPS::start(Uart* uart, int reqPositionMS)
 {
-    _uart = uart;
+    _uart = uart; _linesReadFromEmuFile = 0;
     if (reqPositionMS > 0)
         _timer.start(std::chrono::milliseconds(reqPositionMS), threadFunction, this);
     configureUbxOutput();
@@ -37,6 +51,16 @@ bool UbloxGPS::readFromBuffer()
     int length = _uart ? _uart->readToBuffer(buffer, 128) : 0;
     if (length > 0)
         _dataBuffer.insert(_dataBuffer.end(), buffer, buffer + length);
+    
+    if (_emulatedFile && _linesReadFromEmuFile > 0)
+    {
+        int cnt = _linesReadFromEmuFile; std::string line;
+        while (cnt > 0 && std::getline(_emulatedFile, line))
+        {
+            cnt--; if (cnt > 0) line += "\r\n";
+            _dataBuffer.insert(_dataBuffer.end(), line.begin(), line.end());
+        }
+    }
 
     using FrameType = typename std::decay<decltype(_frame)>::type;
     using MsgPtr = typename FrameType::MsgPtr;
@@ -52,8 +76,84 @@ bool UbloxGPS::readFromBuffer()
         else if (es == comms::ErrorStatus::Success) msgDispatched++;
     }
 
+    if (_emulatedFile.eof()) exit(1);
+
+    if (consumed > 0)
+    {
+        std::string msgBuffer((char*)&(_dataBuffer[0]), consumed);
+        size_t gpggaStart = msgBuffer.find("$GPGGA");
+        if (gpggaStart == std::string::npos) gpggaStart = msgBuffer.find("$GNGGA");
+
+        size_t gpggaEndCRC = msgBuffer.find("*", gpggaStart);
+        if (gpggaStart != std::string::npos && gpggaEndCRC != std::string::npos)
+        {
+            _message_GPGGA_GNGGA = msgBuffer.substr(gpggaStart, gpggaEndCRC + 3 - gpggaStart);
+        }
+    }
     _dataBuffer.erase(_dataBuffer.begin(), _dataBuffer.begin() + consumed);
     return msgDispatched > 0;
+}
+
+bool UbloxGPS::connectNtripCaster(const char* host, int port, const char* mountpoint,
+                                  const char* appName, const char* auth)
+{
+    if (!host || !mountpoint || !appName || !auth)
+    {
+        std::cout << "[UbloxGPS] No enough parameters to start NTRIP client" << std::endl;
+        return false;
+    }
+
+    if (_ntripSocket != NULL) delete _ntripSocket;
+    _ntripSocket = new Socket;
+    try
+    {
+        if (!_ntripSocket->connect(host, port, wincomm::Socket::TCP))
+        {
+            std::cout << "[UbloxGPS] Failed to connect to NTRIP caster" << std::endl;
+            return false;
+        }
+    }
+    catch (std::exception& e)
+    {
+        std::cout << "[UbloxGPS] " << e.what() << std::endl;
+        return false;
+    }
+
+    std::stringstream ss;
+    ss << "GET /" << mountpoint << " HTTP/1.0\r\n"
+       << "User-Agent: " << appName << "\r\n"
+       << "Accept: */*\r\n" << "Connection: close\r\n"
+       << "Authorization: Basic " << auth << "\r\n\r\n";
+    _ntripSocket->write(ss.str().c_str(), ss.str().size());
+    return true;
+}
+
+bool UbloxGPS::updateNtripCaster(std::vector<unsigned char>& casterData, bool sendToGPS)
+{
+    char buffer[1024] = "";
+    if (!_ntripSocket) return false;
+
+    int length = _ntripSocket->read(buffer, 1024);
+    if (length > 0)
+    {
+        casterData.insert(casterData.end(), buffer, buffer + length);
+        if (sendToGPS && _uart) _uart->writeFromBuffer(buffer, length);
+    }
+
+    if (!_message_GPGGA_GNGGA.empty())
+    {
+        _message_GPGGA_GNGGA += "\r\n";
+        _ntripSocket->write(_message_GPGGA_GNGGA.c_str(), _message_GPGGA_GNGGA.size());
+        _message_GPGGA_GNGGA = "";
+    }
+    return true;
+}
+
+void UbloxGPS::disconnectNtripCaster()
+{
+    if (!_ntripSocket) return;
+    delete _ntripSocket;
+    _ntripSocket = NULL;
 }
 
 void UbloxGPS::requestPositionPoll()
@@ -89,8 +189,13 @@ void UbloxGPS::handle(InNavSat& msg)
 {
     auto satList = msg.field_list().value();
     _satelliteData.infoList.resize(satList.size());
-    _satelliteData.timeOfWeekMS = comms::units::getMilliseconds<double>(msg.field_itow());
     
+    //std::cout << "satllite number: " << satList.size() << std::endl;
+    
+    _satelliteData.timeOfWeekMS = comms::units::getMilliseconds<double>(msg.field_itow());
+    _satelliteData.score = 0;
+    _satelliteData.valid_count = 0;
+
     for (size_t i = 0; i < satList.size(); ++i)
     {
         auto element = satList.at(i);
@@ -99,8 +204,31 @@ void UbloxGPS::handle(InNavSat& msg)
         _satelliteData.infoList[i].elevation = comms::units::getDegrees<double>(element.field_elev());
         _satelliteData.infoList[i].azimuth = comms::units::getDegrees<double>(element.field_azim());
         _satelliteData.infoList[i].signalCNO = element.field_cno().value();
+        //std::cout << i << ": " << _satelliteData.infoList[i].signalCNO << std::endl;
+
+        if(_satelliteData.infoList[i].signalCNO > satellites_signal_threshold_)
+        {
+            _satelliteData.valid_count++;
+        }
+        _satelliteData.score = _satelliteData.score + _satelliteData.infoList[i].signalCNO;
+
+        //std::cout << _satelliteData.infoList[i].gnssID << ", " << _satelliteData.infoList[i].satelliteID << ", " << _satelliteData.infoList[i].elevation << ", " << _satelliteData.infoList[i].azimuth << ", " << _satelliteData.infoList[i].signalCNO <<std::endl;
     }
     _dirtyMessageTypes |= MSG_SATELLITE;
+}
+
+void UbloxGPS::requestStatusPoll()
+{ sendMessage(ublox::message::NavStatusPoll<OutMessage>()); }
+
+void UbloxGPS::handle(InNavStatus& msg)
+{
+    _statusData.timeOfWeekMS = comms::units::getMilliseconds<double>(msg.field_itow());
+    _statusData.timeToFirstFix = comms::units::getMilliseconds<double>(msg.field_ttff());
+    _statusData.timeSinceStart = comms::units::getMilliseconds<double>(msg.field_msss());
+    _statusData.fixMode = (StatusData::FixMode)msg.field_gpsFix().value();
+    _statusData.gpsFixValid = msg.field_flags().getBitValue_gpsFixOk();
+    _statusData.diffCorrectionValid = msg.field_flags().getBitValue_diffSoln();
+    _dirtyMessageTypes |= MSG_STATUS;
 }
 
 void UbloxGPS::handle(InMessage& msg)

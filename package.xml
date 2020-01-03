@@ -1,10 +1,11 @@
 <?xml version="1.0"?>
 <package format="2">
-  <name>ublox_gps</name>
+  <name>gps_node</name>
   <version>0.0.1</version>
-  <description>ublox_gps node.</description>
+  <description>gps_node node.</description>
   <author>wyw</author>
   <maintainer email="diracweizi@163.com">wyw</maintainer>
+  <maintainer email="wangrui@ydrobot.com">wr</maintainer>
   <url type="website">http://</url>
 
   <license>None</license>
